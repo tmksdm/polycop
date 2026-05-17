@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -439,6 +440,11 @@ async def run_watcher_forever(
 
     Если WebSocket оборвался — ждём несколько секунд и подключаемся снова.
     Более умный exponential backoff сделаем позже на этапе устойчивости.
+
+    Важный момент:
+    asyncio.CancelledError — это нормальный сигнал остановки задачи,
+    например когда пользователь нажал Ctrl+C.
+    Его нельзя логировать как "неожиданную ошибку".
     """
     reconnect_delay_seconds = 5
 
@@ -451,6 +457,12 @@ async def run_watcher_forever(
                 database=database,
                 terminal_ui=terminal_ui,
             )
+        except asyncio.CancelledError:
+            # Это нормальный путь остановки приложения через Ctrl+C.
+            # Не считаем это ошибкой и не печатаем traceback.
+            terminal_ui.set_websocket_status("stopping", "yellow")
+            logger.info("Watcher остановлен")
+            raise
         except ConnectionClosed as error:
             terminal_ui.mark_reconnect()
             terminal_ui.set_websocket_status(
@@ -501,6 +513,7 @@ async def run_watcher_forever(
             )
 
         await asyncio.sleep(reconnect_delay_seconds)
+
 
 
 async def main() -> None:
@@ -592,14 +605,36 @@ async def main() -> None:
             database=database,
             terminal_ui=terminal_ui,
         )
+    except asyncio.CancelledError:
+        # Нормальный путь остановки через Ctrl+C.
+        # Не логируем как ошибку.
+        logger.info("Получен сигнал остановки")
     finally:
         # Аккуратно останавливаем UI.
         stop_ui_event.set()
-        await ui_task
+
+        if not ui_task.done():
+            try:
+                # Даём Rich UI короткое время, чтобы красиво дорисовать последний экран.
+                await asyncio.wait_for(asyncio.shield(ui_task), timeout=2)
+            except TimeoutError:
+                # Если UI завис на обновлении — отменяем задачу.
+                ui_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await ui_task
+            except asyncio.CancelledError:
+                # Если сам main уже отменяется — тоже тихо гасим UI-задачу.
+                ui_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await ui_task
+
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Остановка по Ctrl+C")
+        # На Windows Ctrl+C иногда доходит сюда уже после отмены asyncio-задач.
+        # Это нормальная остановка, не авария.
+        pass
+
