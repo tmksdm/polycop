@@ -11,6 +11,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from app_config import AppConfig, load_app_config
+from database import Database, initialize_database
 from dry_run_engine import (
     HourlySpendTracker,
     evaluate_dry_run_copy,
@@ -156,6 +157,7 @@ async def handle_polymarket_transaction(
     transaction: dict[str, Any],
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
+    database: Database,
 ) -> None:
     """
     Обрабатывает одну транзакцию Polymarket Exchange:
@@ -163,7 +165,8 @@ async def handle_polymarket_transaction(
     - декодирует сделки;
     - применяет фильтр watched traders;
     - обогащает сделки метаданными рынка через Gamma API;
-    - прогоняет сделку через DRY-RUN фильтры.
+    - прогоняет сделку через DRY-RUN фильтры;
+    - сохраняет сделку и DRY-RUN решение в SQLite.
     """
     logger.info("Polymarket raw tx | %s", format_raw_transaction(transaction))
 
@@ -194,7 +197,7 @@ async def handle_polymarket_transaction(
 
     logger.info("Decoded trades: %s", len(visible_trades))
 
-    for trade in visible_trades:
+    for trade_index, trade in enumerate(visible_trades):
         trade_key = _market_metadata_key(trade)
         metadata = market_metadata_by_trade_key.get(trade_key)
 
@@ -208,6 +211,25 @@ async def handle_polymarket_transaction(
                 hourly_tracker=hourly_tracker,
             )
             logger.info("DRY-RUN | %s", format_dry_run_decision(decision))
+
+            try:
+                database.save_trade_and_dry_run_decision(
+                    trade=trade,
+                    trade_index=trade_index,
+                    metadata=metadata,
+                    decision=decision,
+                    config=app_config,
+                )
+                logger.info(
+                    "SQLite history saved | tx=%s | trade_index=%s | decision=%s",
+                    short_hash(trade.tx_hash),
+                    trade_index,
+                    "WOULD_COPY" if decision.accepted else "SKIP",
+                )
+            except Exception:
+                # Ошибка базы не должна валить watcher.
+                # Но её обязательно логируем, чтобы не потерять проблему.
+                logger.exception("Не удалось сохранить сделку в SQLite")
         else:
             # LIVE-режим появится на Этапе 5.
             # До этого момента мы специально не отправляем реальные ордера.
@@ -309,6 +331,7 @@ async def watch_mined_transactions(
     alchemy_wss: str,
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
+    database: Database,
 ) -> None:
     """
     Подключается к Alchemy WebSocket и слушает mined-транзакции.
@@ -379,6 +402,7 @@ async def watch_mined_transactions(
                 transaction=transaction,
                 app_config=app_config,
                 hourly_tracker=hourly_tracker,
+                database=database,
             )
 
 
@@ -386,6 +410,7 @@ async def run_watcher_forever(
     alchemy_wss: str,
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
+    database: Database,
 ) -> None:
     """
     Запускает watcher с простым reconnect.
@@ -401,6 +426,7 @@ async def run_watcher_forever(
                 alchemy_wss=alchemy_wss,
                 app_config=app_config,
                 hourly_tracker=hourly_tracker,
+                database=database,
             )
         except ConnectionClosed as error:
             logger.warning(
@@ -439,14 +465,17 @@ async def main() -> None:
 
     На текущем шаге Этапа 3 она:
     - читает .env;
-    - читает config.json;
+    - читит config.json;
+    - инициализирует SQLite;
     - подключается к Alchemy;
     - декодирует сделки;
     - применяет фильтры;
-    - показывает DRY-RUN решение.
+    - показывает DRY-RUN решение;
+    - сохраняет историю в data/polycop.db.
     """
     app_config = load_app_config(PROJECT_ROOT)
     hourly_tracker = HourlySpendTracker()
+    database = initialize_database(PROJECT_ROOT)
 
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -454,6 +483,7 @@ async def main() -> None:
     logger.info("Start time: %s", started_at)
     logger.info("Mode: %s", "DRY-RUN" if app_config.dry_run else "LIVE")
     logger.info("Config path: %s", app_config.config_path)
+    logger.info("SQLite DB: %s", database.path)
 
     for warning in app_config.warnings:
         logger.warning("Config warning: %s", warning)
@@ -492,6 +522,7 @@ async def main() -> None:
         alchemy_wss=app_config.alchemy_wss,
         app_config=app_config,
         hourly_tracker=hourly_tracker,
+        database=database,
     )
 
 
