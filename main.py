@@ -10,19 +10,18 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from gamma_client import get_market_metadata
+from polymarket_constants import POLYMARKET_EXCHANGE_ADDRESSES
+from trade_decoder import (
+    decode_polymarket_trades,
+    format_trade_for_console,
+    trade_matches_watched_traders,
+)
+from trade_models import DecodedTrade, MarketMetadata
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_ROOT / ".env"
-
-# Основные контракты Polymarket на Polygon.
-# На Этапе 1 мы фильтруем сырые транзакции по этим адресам.
-CTF_EXCHANGE_ADDRESS = "0xE111180000d2663C0091e4f400237545B87B996B"
-NEG_RISK_CTF_EXCHANGE_ADDRESS = "0xe2222d279d744050d28e00520010520000310F59"
-
-POLYMARKET_EXCHANGE_ADDRESSES = [
-    CTF_EXCHANGE_ADDRESS,
-    NEG_RISK_CTF_EXCHANGE_ADDRESS,
-]
 
 
 def setup_logger() -> logging.Logger:
@@ -66,7 +65,7 @@ def load_env_file(path: Path) -> dict[str, str]:
     KEY=value
 
     Мы пока не используем python-dotenv, чтобы не плодить зависимости.
-    Для текущего этапа этого достаточно.
+    Для текущих этапов этого достаточно.
     """
     values: dict[str, str] = {}
 
@@ -180,37 +179,31 @@ def is_probably_evm_address(address: str) -> bool:
     return True
 
 
-def build_mined_transactions_subscription(watched_traders: list[str]) -> dict[str, Any]:
+def build_mined_transactions_subscription() -> dict[str, Any]:
     """
     Собирает JSON-RPC запрос подписки для Alchemy.
 
-    Если watched_traders пустой:
-    - подписываемся на все транзакции, где to = один из контрактов Polymarket.
+    Важно:
+    На Этапе 1 мы пробовали фильтровать пары:
+      from=trader -> to=exchange
 
-    Если watched_traders не пустой:
-    - подписываемся на пары from+to:
-      конкретный трейдер -> контракт Polymarket.
+    На Этапе 2 мы меняем подход:
+    - слушаем все транзакции в Polymarket Exchange;
+    - декодируем matchOrders(...);
+    - ищем адреса трейдеров внутри ордеров.
 
-    Это удобнее и безопаснее, чем слушать весь Polygon без фильтров.
+    Почему:
+    CTF Exchange вызывает оператор Polymarket, а не всегда сам трейдер.
+    Если фильтровать по tx.from, можно пропустить реальные сделки трейдера.
     """
     address_filters: list[dict[str, str]] = []
 
-    if watched_traders:
-        for trader_address in watched_traders:
-            for exchange_address in POLYMARKET_EXCHANGE_ADDRESSES:
-                address_filters.append(
-                    {
-                        "from": trader_address,
-                        "to": exchange_address,
-                    }
-                )
-    else:
-        for exchange_address in POLYMARKET_EXCHANGE_ADDRESSES:
-            address_filters.append(
-                {
-                    "to": exchange_address,
-                }
-            )
+    for exchange_address in POLYMARKET_EXCHANGE_ADDRESSES:
+        address_filters.append(
+            {
+                "to": exchange_address,
+            }
+        )
 
     return {
         "jsonrpc": "2.0",
@@ -244,7 +237,7 @@ def format_raw_transaction(transaction: dict[str, Any]) -> str:
     """
     Делает короткую человекочитаемую строку из сырой транзакции.
 
-    Полную расшифровку input/data будем делать на Этапе 2.
+    Полную расшифровку input/data теперь делает trade_decoder.py.
     """
     tx_hash = transaction.get("hash")
     from_address = transaction.get("from")
@@ -267,6 +260,145 @@ def format_raw_transaction(transaction: dict[str, Any]) -> str:
     )
 
 
+async def handle_polymarket_transaction(
+    transaction: dict[str, Any],
+    watched_traders: list[str],
+) -> None:
+    """
+    Обрабатывает одну транзакцию Polymarket Exchange:
+    - выводит короткую raw-строку;
+    - декодирует сделки;
+    - применяет фильтр WATCHED_TRADERS к decoded maker/signer;
+    - обогащает сделки метаданными рынка через Gamma API.
+
+    Важно:
+    market определяется по condition_id,
+    а outcome определяется по token_id.
+    Поэтому metadata храним по паре condition_id + token_id.
+    """
+    logger.info("Polymarket raw tx | %s", format_raw_transaction(transaction))
+
+    try:
+        trades = decode_polymarket_trades(transaction)
+    except Exception:
+        logger.exception("Ошибка при декодировании транзакции")
+        return
+
+    if not trades:
+        logger.info("Decoded trades: 0 — транзакция не похожа на matchOrders из нашего ABI")
+        return
+
+    visible_trades = [
+        trade
+        for trade in trades
+        if trade_matches_watched_traders(trade, watched_traders)
+    ]
+
+    if watched_traders and not visible_trades:
+        logger.info(
+            "Decoded trades: %s, но отслеживаемые трейдеры не найдены внутри maker/signer",
+            len(trades),
+        )
+        return
+
+    market_metadata_by_trade_key = await _load_market_metadata_for_trades(visible_trades)
+
+    logger.info("Decoded trades: %s", len(visible_trades))
+
+    for trade in visible_trades:
+        trade_key = _market_metadata_key(trade)
+        metadata = market_metadata_by_trade_key.get(trade_key)
+        logger.info("TRADE | %s", format_enriched_trade_for_console(trade, metadata))
+
+async def _load_market_metadata_for_trades(
+    trades: list[DecodedTrade],
+) -> dict[str, MarketMetadata]:
+    """
+    Загружает метаданные рынков для списка сделок.
+
+    Важно:
+    - вопрос рынка общий для condition_id;
+    - outcome зависит от token_id.
+
+    Поэтому результат храним по ключу:
+    condition_id.lower() + ":" + token_id
+    """
+    result: dict[str, MarketMetadata] = {}
+
+    first_trade_by_key: dict[str, DecodedTrade] = {}
+
+    for trade in trades:
+        trade_key = _market_metadata_key(trade)
+
+        if trade_key not in first_trade_by_key:
+            first_trade_by_key[trade_key] = trade
+
+    for trade_key, trade in first_trade_by_key.items():
+        try:
+            metadata = await get_market_metadata(
+                condition_id=trade.condition_id,
+                token_id=trade.token_id,
+            )
+        except Exception:
+            logger.exception(
+                "Неожиданная ошибка при запросе Gamma API для condition_id=%s token_id=%s",
+                _short_text(trade.condition_id, max_length=18),
+                _short_text(str(trade.token_id), max_length=18),
+            )
+            continue
+
+        if metadata is None:
+            logger.info(
+                "Gamma metadata: не найден рынок для condition_id=%s token_id=%s",
+                _short_text(trade.condition_id, max_length=18),
+                _short_text(str(trade.token_id), max_length=18),
+            )
+            continue
+
+        result[trade_key] = metadata
+
+    return result
+
+
+def format_enriched_trade_for_console(
+    trade: DecodedTrade,
+    metadata: MarketMetadata | None,
+) -> str:
+    """
+    Форматирует сделку вместе с информацией о рынке.
+    """
+    base_line = format_trade_for_console(trade)
+
+    if metadata is None:
+        return f"{base_line} | market=unknown | outcome=unknown"
+
+    question = _short_text(metadata.question, max_length=90)
+    outcome = metadata.outcome or "unknown"
+
+    if metadata.slug:
+        return f'{base_line} | market="{question}" | outcome={outcome} | slug={metadata.slug}'
+
+    return f'{base_line} | market="{question}" | outcome={outcome}'
+
+def _market_metadata_key(trade: DecodedTrade) -> str:
+    """
+    Делает ключ для metadata конкретного outcome.
+
+    condition_id один на рынок,
+    token_id указывает на конкретный outcome внутри рынка.
+    """
+    return f"{trade.condition_id.lower()}:{trade.token_id}"
+
+def _short_text(value: str, max_length: int) -> str:
+    """
+    Обрезает длинный текст для консоли.
+    """
+    if len(value) <= max_length:
+        return value
+
+    return f"{value[: max_length - 3]}..."
+
+
 async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str]) -> None:
     """
     Подключается к Alchemy WebSocket и слушает mined-транзакции.
@@ -275,7 +407,7 @@ async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str])
     В отличие от обычного HTTP-запроса, оно остаётся открытым,
     и Alchemy сам присылает нам новые события.
     """
-    subscription_request = build_mined_transactions_subscription(watched_traders)
+    subscription_request = build_mined_transactions_subscription()
 
     logger.info("Подключаюсь к Alchemy WebSocket...")
     logger.info("Alchemy WSS: %s", mask_secret_url(alchemy_wss))
@@ -296,9 +428,14 @@ async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str])
         logger.info("Подписка активна, subscription_id=%s", subscription_id)
 
         if watched_traders:
-            logger.info("Фильтр трейдеров: %s", ", ".join(watched_traders))
+            logger.info(
+                "Фильтр трейдеров включён: ищем адреса внутри decoded maker/signer: %s",
+                ", ".join(watched_traders),
+            )
         else:
-            logger.info("Фильтр трейдеров пустой: слушаем все tx в контракты Polymarket Exchange")
+            logger.info(
+                "Фильтр трейдеров пустой: показываем все decoded сделки в Polymarket Exchange"
+            )
 
         logger.info("Фильтр контрактов: %s", ", ".join(POLYMARKET_EXCHANGE_ADDRESSES))
         logger.info("Жду транзакции... Для остановки нажми Ctrl+C")
@@ -328,7 +465,10 @@ async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str])
                 logger.warning("Неожиданный формат transaction: %s", transaction)
                 continue
 
-            logger.info("Polymarket raw tx | %s", format_raw_transaction(transaction))
+            await handle_polymarket_transaction(
+                transaction=transaction,
+                watched_traders=watched_traders,
+            )
 
 
 async def run_watcher_forever(alchemy_wss: str, watched_traders: list[str]) -> None:
@@ -378,11 +518,13 @@ async def main() -> None:
     """
     Главная асинхронная функция приложения.
 
-    На Этапе 1 она:
+    На Этапе 2 она:
     - читает .env;
     - проверяет настройки;
     - подключается к Alchemy;
-    - слушает сырые транзакции Polymarket Exchange.
+    - слушает транзакции Polymarket Exchange;
+    - декодирует matchOrders(...) в человекочитаемые сделки;
+    - обогащает сделки данными рынка через Gamma API.
     """
     env_values = load_env_file(ENV_PATH)
 
@@ -397,7 +539,7 @@ async def main() -> None:
     logger.info("Mode: %s", "DRY-RUN" if dry_run else "LIVE")
 
     if not dry_run:
-        logger.warning("LIVE режим пока не реализован. На Этапе 1 деньги не используются.")
+        logger.warning("LIVE режим пока не реализован. На Этапе 2 деньги не используются.")
 
     if not alchemy_wss:
         logger.error("Alchemy WSS не настроен")
