@@ -10,6 +10,12 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from app_config import AppConfig, load_app_config
+from dry_run_engine import (
+    HourlySpendTracker,
+    evaluate_dry_run_copy,
+    format_dry_run_decision,
+)
 from gamma_client import get_market_metadata
 from polymarket_constants import POLYMARKET_EXCHANGE_ADDRESSES
 from trade_decoder import (
@@ -21,7 +27,6 @@ from trade_models import DecodedTrade, MarketMetadata
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ENV_PATH = PROJECT_ROOT / ".env"
 
 
 def setup_logger() -> logging.Logger:
@@ -57,38 +62,6 @@ def setup_logger() -> logging.Logger:
 logger = setup_logger()
 
 
-def load_env_file(path: Path) -> dict[str, str]:
-    """
-    Минимальный загрузчик .env-файла.
-
-    Он читает строки вида:
-    KEY=value
-
-    Мы пока не используем python-dotenv, чтобы не плодить зависимости.
-    Для текущих этапов этого достаточно.
-    """
-    values: dict[str, str] = {}
-
-    if not path.exists():
-        return values
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        clean_line = line.strip()
-
-        # Пропускаем пустые строки и комментарии.
-        if not clean_line or clean_line.startswith("#"):
-            continue
-
-        # Если нет "=", это не переменная окружения.
-        if "=" not in clean_line:
-            continue
-
-        key, value = clean_line.split("=", 1)
-        values[key.strip()] = value.strip()
-
-    return values
-
-
 def mask_secret_url(url: str) -> str:
     """
     Маскирует секретный Alchemy URL перед выводом.
@@ -108,93 +81,12 @@ def mask_secret_url(url: str) -> str:
     return f"{prefix}/{masked_secret}"
 
 
-def parse_bool(value: str, default: bool = True) -> bool:
-    """
-    Превращает строку из .env в bool.
-
-    Например:
-    "true", "1", "yes" -> True
-    "false", "0", "no" -> False
-    """
-    clean_value = value.strip().lower()
-
-    if clean_value in {"1", "true", "yes", "y", "on"}:
-        return True
-
-    if clean_value in {"0", "false", "no", "n", "off"}:
-        return False
-
-    return default
-
-
-def parse_address_list(raw_value: str) -> list[str]:
-    """
-    Разбирает список адресов из строки .env.
-
-    Пример:
-    WATCHED_TRADERS=0x111...,0x222...
-
-    Возвращает список строк.
-    """
-    if not raw_value.strip():
-        return []
-
-    addresses: list[str] = []
-
-    for item in raw_value.split(","):
-        address = item.strip()
-
-        if not address:
-            continue
-
-        if not is_probably_evm_address(address):
-            logger.warning("Пропускаю некорректный адрес из WATCHED_TRADERS: %s", address)
-            continue
-
-        addresses.append(address)
-
-    return addresses
-
-
-def is_probably_evm_address(address: str) -> bool:
-    """
-    Простая проверка EVM-адреса.
-
-    EVM-адрес — это адрес кошелька/контракта в сетях типа Ethereum/Polygon.
-    Обычно выглядит как 0x + 40 hex-символов.
-    """
-    if not address.startswith("0x"):
-        return False
-
-    if len(address) != 42:
-        return False
-
-    hex_part = address[2:]
-
-    try:
-        int(hex_part, 16)
-    except ValueError:
-        return False
-
-    return True
-
-
 def build_mined_transactions_subscription() -> dict[str, Any]:
     """
     Собирает JSON-RPC запрос подписки для Alchemy.
 
-    Важно:
-    На Этапе 1 мы пробовали фильтровать пары:
-      from=trader -> to=exchange
-
-    На Этапе 2 мы меняем подход:
-    - слушаем все транзакции в Polymarket Exchange;
-    - декодируем matchOrders(...);
-    - ищем адреса трейдеров внутри ордеров.
-
-    Почему:
-    CTF Exchange вызывает оператор Polymarket, а не всегда сам трейдер.
-    Если фильтровать по tx.from, можно пропустить реальные сделки трейдера.
+    Слушаем все транзакции в Polymarket Exchange,
+    а нужных трейдеров ищем уже внутри decoded maker/signer.
     """
     address_filters: list[dict[str, str]] = []
 
@@ -237,7 +129,7 @@ def format_raw_transaction(transaction: dict[str, Any]) -> str:
     """
     Делает короткую человекочитаемую строку из сырой транзакции.
 
-    Полную расшифровку input/data теперь делает trade_decoder.py.
+    Полную расшифровку input/data делает trade_decoder.py.
     """
     tx_hash = transaction.get("hash")
     from_address = transaction.get("from")
@@ -262,19 +154,16 @@ def format_raw_transaction(transaction: dict[str, Any]) -> str:
 
 async def handle_polymarket_transaction(
     transaction: dict[str, Any],
-    watched_traders: list[str],
+    app_config: AppConfig,
+    hourly_tracker: HourlySpendTracker,
 ) -> None:
     """
     Обрабатывает одну транзакцию Polymarket Exchange:
     - выводит короткую raw-строку;
     - декодирует сделки;
-    - применяет фильтр WATCHED_TRADERS к decoded maker/signer;
-    - обогащает сделки метаданными рынка через Gamma API.
-
-    Важно:
-    market определяется по condition_id,
-    а outcome определяется по token_id.
-    Поэтому metadata храним по паре condition_id + token_id.
+    - применяет фильтр watched traders;
+    - обогащает сделки метаданными рынка через Gamma API;
+    - прогоняет сделку через DRY-RUN фильтры.
     """
     logger.info("Polymarket raw tx | %s", format_raw_transaction(transaction))
 
@@ -291,10 +180,10 @@ async def handle_polymarket_transaction(
     visible_trades = [
         trade
         for trade in trades
-        if trade_matches_watched_traders(trade, watched_traders)
+        if trade_matches_watched_traders(trade, app_config.watched_traders)
     ]
 
-    if watched_traders and not visible_trades:
+    if app_config.watched_traders and not visible_trades:
         logger.info(
             "Decoded trades: %s, но отслеживаемые трейдеры не найдены внутри maker/signer",
             len(trades),
@@ -308,7 +197,22 @@ async def handle_polymarket_transaction(
     for trade in visible_trades:
         trade_key = _market_metadata_key(trade)
         metadata = market_metadata_by_trade_key.get(trade_key)
+
         logger.info("TRADE | %s", format_enriched_trade_for_console(trade, metadata))
+
+        if app_config.dry_run:
+            decision = evaluate_dry_run_copy(
+                trade=trade,
+                metadata=metadata,
+                config=app_config,
+                hourly_tracker=hourly_tracker,
+            )
+            logger.info("DRY-RUN | %s", format_dry_run_decision(decision))
+        else:
+            # LIVE-режим появится на Этапе 5.
+            # До этого момента мы специально не отправляем реальные ордера.
+            logger.warning("LIVE режим ещё не реализован. Сделка не отправлена.")
+
 
 async def _load_market_metadata_for_trades(
     trades: list[DecodedTrade],
@@ -380,6 +284,7 @@ def format_enriched_trade_for_console(
 
     return f'{base_line} | market="{question}" | outcome={outcome}'
 
+
 def _market_metadata_key(trade: DecodedTrade) -> str:
     """
     Делает ключ для metadata конкретного outcome.
@@ -388,6 +293,7 @@ def _market_metadata_key(trade: DecodedTrade) -> str:
     token_id указывает на конкретный outcome внутри рынка.
     """
     return f"{trade.condition_id.lower()}:{trade.token_id}"
+
 
 def _short_text(value: str, max_length: int) -> str:
     """
@@ -399,7 +305,11 @@ def _short_text(value: str, max_length: int) -> str:
     return f"{value[: max_length - 3]}..."
 
 
-async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str]) -> None:
+async def watch_mined_transactions(
+    alchemy_wss: str,
+    app_config: AppConfig,
+    hourly_tracker: HourlySpendTracker,
+) -> None:
     """
     Подключается к Alchemy WebSocket и слушает mined-транзакции.
 
@@ -427,10 +337,10 @@ async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str])
         subscription_id = first_response.get("result")
         logger.info("Подписка активна, subscription_id=%s", subscription_id)
 
-        if watched_traders:
+        if app_config.watched_traders:
             logger.info(
                 "Фильтр трейдеров включён: ищем адреса внутри decoded maker/signer: %s",
-                ", ".join(watched_traders),
+                ", ".join(app_config.watched_traders),
             )
         else:
             logger.info(
@@ -467,11 +377,16 @@ async def watch_mined_transactions(alchemy_wss: str, watched_traders: list[str])
 
             await handle_polymarket_transaction(
                 transaction=transaction,
-                watched_traders=watched_traders,
+                app_config=app_config,
+                hourly_tracker=hourly_tracker,
             )
 
 
-async def run_watcher_forever(alchemy_wss: str, watched_traders: list[str]) -> None:
+async def run_watcher_forever(
+    alchemy_wss: str,
+    app_config: AppConfig,
+    hourly_tracker: HourlySpendTracker,
+) -> None:
     """
     Запускает watcher с простым reconnect.
 
@@ -482,7 +397,11 @@ async def run_watcher_forever(alchemy_wss: str, watched_traders: list[str]) -> N
 
     while True:
         try:
-            await watch_mined_transactions(alchemy_wss, watched_traders)
+            await watch_mined_transactions(
+                alchemy_wss=alchemy_wss,
+                app_config=app_config,
+                hourly_tracker=hourly_tracker,
+            )
         except ConnectionClosed as error:
             logger.warning(
                 "WebSocket соединение закрыто: %s. Переподключение через %s секунд...",
@@ -518,40 +437,62 @@ async def main() -> None:
     """
     Главная асинхронная функция приложения.
 
-    На Этапе 2 она:
+    На текущем шаге Этапа 3 она:
     - читает .env;
-    - проверяет настройки;
+    - читает config.json;
     - подключается к Alchemy;
-    - слушает транзакции Polymarket Exchange;
-    - декодирует matchOrders(...) в человекочитаемые сделки;
-    - обогащает сделки данными рынка через Gamma API.
+    - декодирует сделки;
+    - применяет фильтры;
+    - показывает DRY-RUN решение.
     """
-    env_values = load_env_file(ENV_PATH)
-
-    alchemy_wss = env_values.get("ALCHEMY_POLYGON_WSS", "")
-    dry_run = parse_bool(env_values.get("DRY_RUN", "true"), default=True)
-    watched_traders = parse_address_list(env_values.get("WATCHED_TRADERS", ""))
+    app_config = load_app_config(PROJECT_ROOT)
+    hourly_tracker = HourlySpendTracker()
 
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     logger.info("Polycop started")
     logger.info("Start time: %s", started_at)
-    logger.info("Mode: %s", "DRY-RUN" if dry_run else "LIVE")
+    logger.info("Mode: %s", "DRY-RUN" if app_config.dry_run else "LIVE")
+    logger.info("Config path: %s", app_config.config_path)
 
-    if not dry_run:
-        logger.warning("LIVE режим пока не реализован. На Этапе 2 деньги не используются.")
+    for warning in app_config.warnings:
+        logger.warning("Config warning: %s", warning)
 
-    if not alchemy_wss:
+    logger.info(
+        "Risk config: ratio=%s%% | min_bet=$%s | hourly_limit=%s%% of $%s | price=%s–%s¢",
+        app_config.risk.ratio_percent,
+        app_config.risk.min_bet_usdc,
+        app_config.risk.hourly_limit_percent,
+        app_config.risk.dry_run_balance_usdc,
+        app_config.risk.min_price_cents,
+        app_config.risk.max_price_cents,
+    )
+
+    logger.info(
+        "Sell config: mode=%s | auto_sell_threshold=%s¢ | sell_percentage=%s%%",
+        app_config.sell.sell_mode,
+        app_config.sell.auto_sell_threshold_cents,
+        app_config.sell.sell_percentage,
+    )
+
+    if not app_config.dry_run:
+        logger.warning("LIVE режим пока не реализован. Деньги не используются.")
+
+    if not app_config.alchemy_wss:
         logger.error("Alchemy WSS не настроен")
         logger.error("Добавь ALCHEMY_POLYGON_WSS в локальный .env")
         return
 
-    if not alchemy_wss.startswith("wss://"):
+    if not app_config.alchemy_wss.startswith("wss://"):
         logger.error("Некорректный Alchemy WSS")
         logger.error("Ожидаю URL, который начинается с wss://")
         return
 
-    await run_watcher_forever(alchemy_wss, watched_traders)
+    await run_watcher_forever(
+        alchemy_wss=app_config.alchemy_wss,
+        app_config=app_config,
+        hourly_tracker=hourly_tracker,
+    )
 
 
 if __name__ == "__main__":

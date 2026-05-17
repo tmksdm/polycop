@@ -6,11 +6,18 @@ __pycache__/
 .env.*
 !.env.example
 
+# Локальная конфигурация пользователя.
+# В Git кладём только config.example.json.
+config.json
+
 *.key
 *.pem
 secrets/
 
+# Локальные базы данных и служебные файлы SQLite.
+data/
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
 

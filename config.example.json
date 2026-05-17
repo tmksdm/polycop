@@ -1,0 +1,16 @@
+{
+  "risk": {
+    "ratio_percent": 1,
+    "min_bet_usdc": 100,
+    "hourly_limit_percent": 20,
+    "dry_run_balance_usdc": 100,
+    "min_price_cents": 3,
+    "max_price_cents": 97
+  },
+  "sell": {
+    "sell_mode": "Full",
+    "auto_sell_threshold_cents": 99,
+    "sell_percentage": 100
+  },
+  "traders": []
+}
