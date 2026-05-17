@@ -19,6 +19,7 @@ from dry_run_engine import (
 )
 from gamma_client import get_market_metadata
 from polymarket_constants import POLYMARKET_EXCHANGE_ADDRESSES
+from terminal_ui import TerminalUI, configure_logger_for_ui
 from trade_decoder import (
     decode_polymarket_trades,
     format_trade_for_console,
@@ -34,16 +35,12 @@ def setup_logger() -> logging.Logger:
     """
     Настраивает базовый logger.
 
-    Logger лучше обычных print, потому что:
-    - у сообщений есть уровень: INFO, WARNING, ERROR;
-    - видно время события;
-    - позже мы легко добавим запись логов в файл.
+    На Этапе 3.3 мы перенастраиваем его так,
+    чтобы логи уходили не напрямую в терминал, а в Rich UI.
     """
     logger = logging.getLogger("polycop")
     logger.setLevel(logging.INFO)
 
-    # Защита от повторного добавления обработчиков,
-    # если файл когда-нибудь будет импортироваться несколько раз.
     if logger.handlers:
         return logger
 
@@ -130,7 +127,8 @@ def format_raw_transaction(transaction: dict[str, Any]) -> str:
     """
     Делает короткую человекочитаемую строку из сырой транзакции.
 
-    Полную расшифровку input/data делает trade_decoder.py.
+    Сейчас эта функция остаётся полезной для отладки,
+    но в спокойном UI-режиме мы не печатаем каждую raw tx в лог.
     """
     tx_hash = transaction.get("hash")
     from_address = transaction.get("from")
@@ -158,17 +156,23 @@ async def handle_polymarket_transaction(
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
     database: Database,
+    terminal_ui: TerminalUI,
 ) -> None:
     """
-    Обрабатывает одну транзакцию Polymarket Exchange:
-    - выводит короткую raw-строку;
-    - декодирует сделки;
-    - применяет фильтр watched traders;
-    - обогащает сделки метаданными рынка через Gamma API;
-    - прогоняет сделку через DRY-RUN фильтры;
-    - сохраняет сделку и DRY-RUN решение в SQLite.
+    Обрабатывает одну транзакцию Polymarket Exchange.
+
+    В спокойном UI-режиме:
+    - raw tx считаем в статистике, но не спамим в лог;
+    - последние сделки показываем в центральной таблице;
+    - DRY-RUN решения показываем в центральной таблице;
+    - в правый лог пишем только важное: ошибки, предупреждения, WOULD_COPY.
+
+    Важная защита:
+    - если watched_traders пустой, это broad/debug scan;
+    - в таком режиме SQLite НЕ сохраняет сделки, чтобы база не раздувалась;
+    - если watched_traders заполнен, сохраняем историю как раньше.
     """
-    logger.info("Polymarket raw tx | %s", format_raw_transaction(transaction))
+    terminal_ui.record_raw_transaction()
 
     try:
         trades = decode_polymarket_trades(transaction)
@@ -176,8 +180,9 @@ async def handle_polymarket_transaction(
         logger.exception("Ошибка при декодировании транзакции")
         return
 
+    # Большинство транзакций могут быть не тем matchOrders, который нам нужен.
+    # Это нормальная ситуация, поэтому не спамим логом.
     if not trades:
-        logger.info("Decoded trades: 0 — транзакция не похожа на matchOrders из нашего ABI")
         return
 
     visible_trades = [
@@ -186,22 +191,24 @@ async def handle_polymarket_transaction(
         if trade_matches_watched_traders(trade, app_config.watched_traders)
     ]
 
+    # Если фильтр трейдеров включён и в этой транзакции их нет —
+    # просто пропускаем без шума.
     if app_config.watched_traders and not visible_trades:
-        logger.info(
-            "Decoded trades: %s, но отслеживаемые трейдеры не найдены внутри maker/signer",
-            len(trades),
-        )
         return
 
     market_metadata_by_trade_key = await _load_market_metadata_for_trades(visible_trades)
 
-    logger.info("Decoded trades: %s", len(visible_trades))
+    terminal_ui.record_decoded_trades_count(len(visible_trades))
+
+    # Историю сохраняем только в рабочем режиме,
+    # когда выбран хотя бы один конкретный трейдер.
+    should_save_sqlite_history = bool(app_config.watched_traders)
 
     for trade_index, trade in enumerate(visible_trades):
         trade_key = _market_metadata_key(trade)
         metadata = market_metadata_by_trade_key.get(trade_key)
 
-        logger.info("TRADE | %s", format_enriched_trade_for_console(trade, metadata))
+        terminal_ui.record_trade(trade=trade, metadata=metadata)
 
         if app_config.dry_run:
             decision = evaluate_dry_run_copy(
@@ -210,26 +217,30 @@ async def handle_polymarket_transaction(
                 config=app_config,
                 hourly_tracker=hourly_tracker,
             )
-            logger.info("DRY-RUN | %s", format_dry_run_decision(decision))
 
-            try:
-                database.save_trade_and_dry_run_decision(
-                    trade=trade,
-                    trade_index=trade_index,
-                    metadata=metadata,
-                    decision=decision,
-                    config=app_config,
-                )
-                logger.info(
-                    "SQLite history saved | tx=%s | trade_index=%s | decision=%s",
-                    short_hash(trade.tx_hash),
-                    trade_index,
-                    "WOULD_COPY" if decision.accepted else "SKIP",
-                )
-            except Exception:
-                # Ошибка базы не должна валить watcher.
-                # Но её обязательно логируем, чтобы не потерять проблему.
-                logger.exception("Не удалось сохранить сделку в SQLite")
+            terminal_ui.record_decision(decision)
+
+            # В лог пишем только WOULD_COPY, потому что это важный сигнал.
+            # SKIP виден в таблице решений, но не должен шуметь справа.
+            if decision.accepted:
+                logger.info("DRY-RUN | %s", format_dry_run_decision(decision))
+
+            if should_save_sqlite_history:
+                try:
+                    database.save_trade_and_dry_run_decision(
+                        trade=trade,
+                        trade_index=trade_index,
+                        metadata=metadata,
+                        decision=decision,
+                        config=app_config,
+                    )
+
+                    terminal_ui.record_sqlite_save()
+
+                except Exception:
+                    # Ошибка базы не должна валить watcher.
+                    # Но её обязательно логируем, чтобы не потерять проблему.
+                    logger.exception("Не удалось сохранить сделку в SQLite")
         else:
             # LIVE-режим появится на Этапе 5.
             # До этого момента мы специально не отправляем реальные ордера.
@@ -273,12 +284,9 @@ async def _load_market_metadata_for_trades(
             )
             continue
 
+        # Если Gamma API не нашёл рынок — это не критическая ошибка.
+        # Сделку всё равно показываем как market=unknown/outcome=unknown.
         if metadata is None:
-            logger.info(
-                "Gamma metadata: не найден рынок для condition_id=%s token_id=%s",
-                _short_text(trade.condition_id, max_length=18),
-                _short_text(str(trade.token_id), max_length=18),
-            )
             continue
 
         result[trade_key] = metadata
@@ -292,6 +300,9 @@ def format_enriched_trade_for_console(
 ) -> str:
     """
     Форматирует сделку вместе с информацией о рынке.
+
+    Сейчас используется в основном для отладки.
+    UI показывает сделку таблично.
     """
     base_line = format_trade_for_console(trade)
 
@@ -332,6 +343,7 @@ async def watch_mined_transactions(
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
     database: Database,
+    terminal_ui: TerminalUI,
 ) -> None:
     """
     Подключается к Alchemy WebSocket и слушает mined-транзакции.
@@ -342,10 +354,13 @@ async def watch_mined_transactions(
     """
     subscription_request = build_mined_transactions_subscription()
 
+    terminal_ui.set_websocket_status("connecting", "yellow")
+
     logger.info("Подключаюсь к Alchemy WebSocket...")
     logger.info("Alchemy WSS: %s", mask_secret_url(alchemy_wss))
 
     async with websockets.connect(alchemy_wss, ping_interval=20, ping_timeout=20) as websocket:
+        terminal_ui.set_websocket_status("connected", "green")
         logger.info("WebSocket подключен")
 
         await websocket.send(json.dumps(subscription_request))
@@ -355,9 +370,12 @@ async def watch_mined_transactions(
         first_response = json.loads(first_response_raw)
 
         if "error" in first_response:
+            terminal_ui.set_websocket_status("subscription error", "red")
             raise RuntimeError(f"Alchemy вернул ошибку подписки: {first_response['error']}")
 
         subscription_id = first_response.get("result")
+
+        terminal_ui.set_websocket_status("subscribed", "green")
         logger.info("Подписка активна, subscription_id=%s", subscription_id)
 
         if app_config.watched_traders:
@@ -366,8 +384,10 @@ async def watch_mined_transactions(
                 ", ".join(app_config.watched_traders),
             )
         else:
-            logger.info(
-                "Фильтр трейдеров пустой: показываем все decoded сделки в Polymarket Exchange"
+            logger.warning(
+                "Broad scan mode: watched traders пустой. "
+                "UI показывает все decoded сделки, но SQLite history отключена, "
+                "чтобы не раздувать базу."
             )
 
         logger.info("Фильтр контрактов: %s", ", ".join(POLYMARKET_EXCHANGE_ADDRESSES))
@@ -403,6 +423,7 @@ async def watch_mined_transactions(
                 app_config=app_config,
                 hourly_tracker=hourly_tracker,
                 database=database,
+                terminal_ui=terminal_ui,
             )
 
 
@@ -411,6 +432,7 @@ async def run_watcher_forever(
     app_config: AppConfig,
     hourly_tracker: HourlySpendTracker,
     database: Database,
+    terminal_ui: TerminalUI,
 ) -> None:
     """
     Запускает watcher с простым reconnect.
@@ -427,30 +449,52 @@ async def run_watcher_forever(
                 app_config=app_config,
                 hourly_tracker=hourly_tracker,
                 database=database,
+                terminal_ui=terminal_ui,
             )
         except ConnectionClosed as error:
+            terminal_ui.mark_reconnect()
+            terminal_ui.set_websocket_status(
+                f"reconnect in {reconnect_delay_seconds}s",
+                "yellow",
+            )
             logger.warning(
                 "WebSocket соединение закрыто: %s. Переподключение через %s секунд...",
                 error,
                 reconnect_delay_seconds,
             )
         except OSError as error:
+            terminal_ui.mark_reconnect()
+            terminal_ui.set_websocket_status(
+                f"reconnect in {reconnect_delay_seconds}s",
+                "yellow",
+            )
             logger.warning(
                 "Сетевая ошибка: %s. Переподключение через %s секунд...",
                 error,
                 reconnect_delay_seconds,
             )
         except RuntimeError as error:
+            terminal_ui.set_websocket_status("stopped", "red")
             logger.error("Ошибка выполнения: %s", error)
             logger.error("Останавливаю watcher, потому что это не похоже на временный сетевой сбой")
             return
         except json.JSONDecodeError as error:
+            terminal_ui.mark_reconnect()
+            terminal_ui.set_websocket_status(
+                f"reconnect in {reconnect_delay_seconds}s",
+                "yellow",
+            )
             logger.warning(
                 "Не смог разобрать JSON от Alchemy: %s. Переподключение через %s секунд...",
                 error,
                 reconnect_delay_seconds,
             )
         except Exception:
+            terminal_ui.mark_reconnect()
+            terminal_ui.set_websocket_status(
+                f"reconnect in {reconnect_delay_seconds}s",
+                "yellow",
+            )
             logger.exception(
                 "Неожиданная ошибка. Переподключение через %s секунд...",
                 reconnect_delay_seconds,
@@ -465,65 +509,93 @@ async def main() -> None:
 
     На текущем шаге Этапа 3 она:
     - читает .env;
-    - читит config.json;
+    - читает config.json;
     - инициализирует SQLite;
+    - запускает Rich terminal UI;
     - подключается к Alchemy;
     - декодирует сделки;
     - применяет фильтры;
     - показывает DRY-RUN решение;
-    - сохраняет историю в data/polycop.db.
+    - сохраняет историю в data/polycop.db только если выбран watched trader.
     """
     app_config = load_app_config(PROJECT_ROOT)
     hourly_tracker = HourlySpendTracker()
     database = initialize_database(PROJECT_ROOT)
 
-    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    logger.info("Polycop started")
-    logger.info("Start time: %s", started_at)
-    logger.info("Mode: %s", "DRY-RUN" if app_config.dry_run else "LIVE")
-    logger.info("Config path: %s", app_config.config_path)
-    logger.info("SQLite DB: %s", database.path)
-
-    for warning in app_config.warnings:
-        logger.warning("Config warning: %s", warning)
-
-    logger.info(
-        "Risk config: ratio=%s%% | min_bet=$%s | hourly_limit=%s%% of $%s | price=%s–%s¢",
-        app_config.risk.ratio_percent,
-        app_config.risk.min_bet_usdc,
-        app_config.risk.hourly_limit_percent,
-        app_config.risk.dry_run_balance_usdc,
-        app_config.risk.min_price_cents,
-        app_config.risk.max_price_cents,
-    )
-
-    logger.info(
-        "Sell config: mode=%s | auto_sell_threshold=%s¢ | sell_percentage=%s%%",
-        app_config.sell.sell_mode,
-        app_config.sell.auto_sell_threshold_cents,
-        app_config.sell.sell_percentage,
-    )
-
-    if not app_config.dry_run:
-        logger.warning("LIVE режим пока не реализован. Деньги не используются.")
-
-    if not app_config.alchemy_wss:
-        logger.error("Alchemy WSS не настроен")
-        logger.error("Добавь ALCHEMY_POLYGON_WSS в локальный .env")
-        return
-
-    if not app_config.alchemy_wss.startswith("wss://"):
-        logger.error("Некорректный Alchemy WSS")
-        logger.error("Ожидаю URL, который начинается с wss://")
-        return
-
-    await run_watcher_forever(
-        alchemy_wss=app_config.alchemy_wss,
+    terminal_ui = TerminalUI(
         app_config=app_config,
-        hourly_tracker=hourly_tracker,
-        database=database,
+        database_path=database.path,
     )
+
+    # После этого logger пишет не обычными строками в терминал,
+    # а в правую панель Logs внутри Rich UI.
+    configure_logger_for_ui(logger, terminal_ui)
+
+    stop_ui_event = asyncio.Event()
+    ui_task = asyncio.create_task(terminal_ui.run(stop_ui_event))
+
+    try:
+        started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        logger.info("Polycop started")
+        logger.info("Start time: %s", started_at)
+        logger.info("Mode: %s", "DRY-RUN" if app_config.dry_run else "LIVE")
+        logger.info("Config path: %s", app_config.config_path)
+        logger.info("SQLite DB: %s", database.path)
+
+        for warning in app_config.warnings:
+            logger.warning("Config warning: %s", warning)
+
+        logger.info(
+            "Risk config: ratio=%s%% | min_bet=$%s | hourly_limit=%s%% of $%s | price=%s–%s¢",
+            app_config.risk.ratio_percent,
+            app_config.risk.min_bet_usdc,
+            app_config.risk.hourly_limit_percent,
+            app_config.risk.dry_run_balance_usdc,
+            app_config.risk.min_price_cents,
+            app_config.risk.max_price_cents,
+        )
+
+        logger.info(
+            "Sell config: mode=%s | auto_sell_threshold=%s¢ | sell_percentage=%s%%",
+            app_config.sell.sell_mode,
+            app_config.sell.auto_sell_threshold_cents,
+            app_config.sell.sell_percentage,
+        )
+
+        if app_config.watched_traders:
+            logger.info("SQLite history: enabled for watched traders")
+        else:
+            logger.warning(
+                "SQLite history: disabled because watched traders list is empty"
+            )
+
+        if not app_config.dry_run:
+            logger.warning("LIVE режим пока не реализован. Деньги не используются.")
+
+        if not app_config.alchemy_wss:
+            terminal_ui.set_websocket_status("missing WSS", "red")
+            logger.error("Alchemy WSS не настроен")
+            logger.error("Добавь ALCHEMY_POLYGON_WSS в локальный .env")
+            return
+
+        if not app_config.alchemy_wss.startswith("wss://"):
+            terminal_ui.set_websocket_status("bad WSS", "red")
+            logger.error("Некорректный Alchemy WSS")
+            logger.error("Ожидаю URL, который начинается с wss://")
+            return
+
+        await run_watcher_forever(
+            alchemy_wss=app_config.alchemy_wss,
+            app_config=app_config,
+            hourly_tracker=hourly_tracker,
+            database=database,
+            terminal_ui=terminal_ui,
+        )
+    finally:
+        # Аккуратно останавливаем UI.
+        stop_ui_event.set()
+        await ui_task
 
 
 if __name__ == "__main__":
