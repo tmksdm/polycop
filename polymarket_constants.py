@@ -20,5 +20,9 @@ POLYMARKET_EXCHANGE_ADDRESSES = [
 # То есть 1 USDC = 1_000_000 raw units.
 USDC_DECIMALS = Decimal("1000000")
 
-# Позже на этом этапе подключим Gamma API для названий рынков.
+# Gamma API — метаданные рынков (вопрос, outcomes, slug).
 GAMMA_API_BASE_URL = "https://gamma-api.polymarket.com"
+
+# Data API — публичные данные: лидерборд, активность, позиции.
+# Этап 4: используем для лидерборда активных трейдеров.
+DATA_API_BASE_URL = "https://data-api.polymarket.com"

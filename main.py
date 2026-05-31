@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -19,6 +20,8 @@ from dry_run_engine import (
     format_dry_run_decision,
 )
 from gamma_client import get_market_metadata
+from leaderboard_client import build_leaderboard
+from leaderboard_ui import prompt_and_save_selection, render_leaderboard_table
 from polymarket_constants import POLYMARKET_EXCHANGE_ADDRESSES
 from terminal_ui import TerminalUI, configure_logger_for_ui
 from trade_decoder import (
@@ -630,9 +633,153 @@ async def main() -> None:
 
 
 
+async def run_leaderboard_mode(args: argparse.Namespace) -> None:
+    """
+    Режим лидерборда (Этап 4.1).
+
+    Это отдельный разовый режим, не связанный с watcher'ом:
+    - тянет топ-трейдеров из Polymarket Data API;
+    - считает наш композитный score;
+    - показывает таблицу;
+    - предлагает добавить выбранных в config.json.
+
+    Здесь НЕ запускается live-дашборд и НЕ трогается WebSocket.
+    Поэтому логи здесь обычные, в терминал, а не в Rich Live.
+    """
+    # Настраиваем логгер ЯВНО под режим лидерборда.
+    #
+    # Почему не logging.basicConfig:
+    # при импорте main.py уже сработал setup_logger() и прицепил
+    # свой обработчик (трубу для вывода). Если просто добавить ещё одну,
+    # каждое сообщение печатается дважды.
+    #
+    # Поэтому сначала убираем все старые трубы, потом ставим одну свою.
+    logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.INFO)
+    # propagate=False, чтобы сообщение не уходило ещё и к корневому логгеру
+    # (иначе можно снова получить дубли).
+    logger.propagate = False
+
+    app_config = load_app_config(PROJECT_ROOT)
+
+    logger.info("Режим лидерборда")
+    logger.info(
+        "Параметры: period=%s | order=%s | category=%s | limit=%s | probe_activity=%s",
+        args.period,
+        args.order,
+        args.category,
+        args.limit,
+        not args.no_probe,
+    )
+
+    entries = await build_leaderboard(
+        time_period=args.period,
+        order_by=args.order,
+        category=args.category,
+        limit=args.limit,
+        probe_activity=not args.no_probe,
+    )
+
+    if not entries:
+        logger.error("Лидерборд пустой. Возможно, Data API недоступен или параметры неверны.")
+        return
+
+    render_leaderboard_table(
+        entries,
+        time_period=args.period,
+        order_by=args.order,
+    )
+
+    prompt_and_save_selection(entries, app_config.config_path)
+
+
+
+def parse_cli_args() -> argparse.Namespace:
+    """
+    Разбирает аргументы командной строки.
+
+    Без аргументов — обычный режим watcher (как раньше).
+    С флагом --leaderboard — режим лидерборда.
+    """
+    parser = argparse.ArgumentParser(
+        description="Polymarket Shadow Trader (polycop)",
+    )
+
+    parser.add_argument(
+        "--leaderboard",
+        action="store_true",
+        help="Показать лидерборд активных трейдеров и выбрать кого копировать.",
+    )
+
+    parser.add_argument(
+        "--period",
+        choices=["DAY", "WEEK", "MONTH", "ALL"],
+        default="MONTH",
+        help="Период лидерборда (по умолчанию MONTH).",
+    )
+
+    parser.add_argument(
+        "--order",
+        choices=["PNL", "VOL"],
+        default="PNL",
+        help="По чему сортировать исходный топ (по умолчанию PNL).",
+    )
+
+    parser.add_argument(
+        "--category",
+        choices=[
+            "OVERALL",
+            "POLITICS",
+            "SPORTS",
+            "CRYPTO",
+            "CULTURE",
+            "MENTIONS",
+            "WEATHER",
+            "ECONOMICS",
+            "TECH",
+            "FINANCE",
+        ],
+        default="OVERALL",
+        help="Категория рынков (по умолчанию OVERALL).",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Сколько трейдеров запросить из топа (1–50, по умолчанию 25).",
+    )
+
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Не ходить в /activity за свежестью (быстрее, но без freshness-score).",
+    )
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    cli_args = parse_cli_args()
+
     try:
-        asyncio.run(main())
+        if cli_args.leaderboard:
+            # Разовый режим лидерборда.
+            asyncio.run(run_leaderboard_mode(cli_args))
+        else:
+            # Обычный режим watcher (как было раньше).
+            asyncio.run(main())
     except KeyboardInterrupt:
         # На Windows Ctrl+C иногда доходит сюда уже после отмены asyncio-задач.
         # Это нормальная остановка, не авария.
