@@ -98,25 +98,47 @@ class TerminalUI:
         self.recent_decisions: Deque[RecentDecisionRow] = deque(maxlen=8)
         self.recent_logs: Deque[LogRow] = deque(maxlen=14)
 
+        # Флаг "что-то изменилось".
+        # UI перерисовывает экран только когда флаг поднят.
+        # Это убирает холостые перерисовки и мерцание.
+        self._dirty = True
+
     async def run(self, stop_event: asyncio.Event) -> None:
         """
         Запускает live-отрисовку UI.
 
         stop_event — сигнал остановки.
         Когда main.py его выставит, UI аккуратно завершится.
+
+        Главное против мерцания:
+        перерисовываем экран ТОЛЬКО когда что-то изменилось (флаг _dirty).
+        В большинстве тиков ничего не поменялось — значит, и перерисовывать нечего.
         """
         with Live(
             self.render(),
+            # Меньше частота авто-обновления Rich = меньше шанс мерцания.
             refresh_per_second=4,
             screen=True,
             transient=False,
+            # Сами решаем, когда обновлять (через live.update),
+            # поэтому авто-refresh держим минимальным.
+            auto_refresh=False,
         ) as live:
-            while not stop_event.is_set():
-                live.update(self.render())
-                await asyncio.sleep(0.25)
+            # Рисуем стартовый экран один раз.
+            live.update(self.render(), refresh=True)
+            self._dirty = False
 
-            # Финальное обновление перед выходом.
-            live.update(self.render())
+            while not stop_event.is_set():
+                # Перерисовываем ТОЛЬКО если что-то реально изменилось.
+                if self._dirty:
+                    live.update(self.render(), refresh=True)
+                    self._dirty = False
+
+                await asyncio.sleep(0.2)
+
+            # Финальное обновление перед выходом, чтобы показать последний экран.
+            live.update(self.render(), refresh=True)
+
 
     def set_websocket_status(self, status: str, style: str = "white") -> None:
         """
@@ -473,9 +495,14 @@ class TerminalUI:
 
     def _touch(self) -> None:
         """
-        Обновляет время последнего события.
+        Обновляет время последнего события и поднимает флаг изменений.
+
+        Любое изменение данных в UI проходит через _touch(),
+        поэтому здесь же удобно помечать, что экран надо перерисовать.
         """
         self.last_event_at = datetime.now()
+        self._dirty = True
+
 
 
 class TerminalUILogHandler(logging.Handler):
